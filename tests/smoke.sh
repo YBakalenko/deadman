@@ -44,6 +44,16 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: applicat
 [ -s "$P/var/lib/deadman/last_beat" ] || fail "сигнал не записан"
 ok "сигнал POST с телом Alertmanager принят"
 
+# Как запускает lighttpd на Keenetic: окружение почти пустое, утилит в PATH нет.
+cgi=$P/share/deadman/www/beat
+out=$(cd "$P/share/deadman/www" && env -i PATH=/nonexistent PATH_INFO="/$tok" "$cgi")
+echo "$out" | grep -q '^ok' || fail "обработчик без PATH: $out"
+out=$(cd "$P/share/deadman/www" && env -i PATH=/nonexistent REQUEST_URI="/beat/$tok?x=1" "$cgi")
+echo "$out" | grep -q '^ok' || fail "ключ из REQUEST_URI: $out"
+out=$(cd "$P/share/deadman/www" && env -i PATH_INFO="/$tok" ./beat)
+echo "$out" | grep -q '^ok' || fail "обработчик по относительному пути: $out"
+ok "обработчик работает без PATH, из REQUEST_URI и по относительному пути"
+
 $D stop >/dev/null
 st=$P/var/lib/deadman
 outbox() { cat "$st"/outbox/* 2>/dev/null || true; }

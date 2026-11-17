@@ -2,16 +2,37 @@
 # Приём сигнала «жив»: GET или POST на /beat/<ключ>. Тело запроса (например,
 # JSON от Alertmanager) не читается по смыслу — важна только регулярность.
 # Неверный ключ — 404, как будто адреса нет вовсе.
-here=$(cd "$(dirname "$0")" && pwd)
+#
+# ⚠️ lighttpd запускает обработчик почти с пустым окружением, без PATH. На
+# Keenetic утилиты Entware лежат в /opt/bin, а busybox прошивки урезан: без
+# своего PATH `cat`/`dirname` не находились, ключ читался пустым, и верный
+# ключ получал 404 (1.0.1). Поэтому PATH задаётся здесь, а всё, что можно,
+# делается встроенными средствами оболочки.
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Префикс установки — из пути самого обработчика (…/share/deadman/www/beat).
+case "$0" in
+  */*) here=$(cd "${0%/*}" && pwd) ;;
+  *) here=$(pwd) ;;
+esac
 P=${here%/share/deadman/www}
-token=$(cat "$P/etc/deadman/beat.token" 2>/dev/null)
+[ -r "$P/etc/deadman/beat.token" ] || P=/opt
+
+token=""
+read -r token <"$P/etc/deadman/beat.token" 2>/dev/null
+
+# Ключ — из PATH_INFO, а если сервер его не дал — из самого адреса запроса.
 got=${PATH_INFO#/}
+if [ -z "$got" ]; then
+  got=${REQUEST_URI#*/beat/}
+  got=${got%%\?*}
+fi
 
 # Дочитать тело, чтобы отправитель не получил обрыв соединения.
 case "${CONTENT_LENGTH:-0}" in
-  ''|*[!0-9]*) ;;
-  0) ;;
-  *) [ "$CONTENT_LENGTH" -le 65536 ] && head -c "$CONTENT_LENGTH" >/dev/null ;;
+  ''|*[!0-9]*|0) ;;
+  *) [ "$CONTENT_LENGTH" -le 65536 ] && dd bs="$CONTENT_LENGTH" count=1 >/dev/null 2>&1 ;;
 esac
 
 if [ -n "$token" ] && [ "$got" = "$token" ]; then
