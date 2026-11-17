@@ -50,7 +50,7 @@
 
 ```sh
 opkg update && opkg install curl
-curl -fsSLO https://raw.githubusercontent.com/YOUR_GITHUB_USER/keen-deadman/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/YBakalenko/deadman/main/install.sh
 sh install.sh
 ```
 
