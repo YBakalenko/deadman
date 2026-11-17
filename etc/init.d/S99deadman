@@ -1,5 +1,5 @@
 #!/bin/sh
-# Автозапуск keen-deadman при старте Entware.
+# Автозапуск deadman при старте Entware.
 case "$1" in
   start|stop|restart|status) exec /opt/bin/deadman "$1" ;;
   *) echo "Использование: $0 {start|stop|restart|status}"; exit 1 ;;

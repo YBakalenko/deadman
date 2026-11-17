@@ -1,9 +1,9 @@
 #!/bin/sh
 # ============================================================================
-# Установка keen-deadman на Keenetic с Entware.
+# Установка deadman на Keenetic с Entware.
 #
 #   opkg update && opkg install curl
-#   curl -fsSLO https://raw.githubusercontent.com/YOUR_GITHUB_USER/keen-deadman/main/install.sh
+#   curl -fsSLO https://raw.githubusercontent.com/YBakalenko/deadman/main/install.sh
 #   sh install.sh
 #
 # Повторный запуск обновляет программу и сохраняет настройки. Запуск из
@@ -11,8 +11,9 @@
 # ============================================================================
 set -eu
 
-# ⚠️ После публикации репозитория впишите сюда своё имя на GitHub.
-REPO_OWNER="${DEADMAN_REPO:-YOUR_GITHUB_USER/keen-deadman}"
+# Репозиторий: https://github.com/YBakalenko/deadman. Форк ставится так же:
+# DEADMAN_REPO=<логин>/<репозиторий> sh install.sh
+REPO_OWNER="${DEADMAN_REPO:-YBakalenko/deadman}"
 BRANCH="${DEADMAN_BRANCH:-main}"
 
 P="${DEADMAN_PREFIX:-/opt}"
@@ -54,7 +55,7 @@ if [ -f "$here/bin/deadman" ] && [ -f "$here/share/www/beat" ]; then
   SRC="$here"
   say "Ставлю из $SRC"
 else
-  tmp="/tmp/keen-deadman.$$"
+  tmp="/tmp/deadman.$$"
   rm -rf "$tmp"; mkdir -p "$tmp"
   url="https://github.com/$REPO_OWNER/archive/refs/heads/$BRANCH.tar.gz"
   say "Скачиваю $url"

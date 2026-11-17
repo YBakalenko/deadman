@@ -1,4 +1,4 @@
-# keen-deadman: отдельный экземпляр lighttpd только для приёма сигнала.
+# deadman: отдельный экземпляр lighttpd только для приёма сигнала.
 # Собирается командой `deadman start` из этого шаблона — правьте шаблон
 # (/opt/share/deadman/lighttpd.conf.in) или deadman.conf, а не готовый файл.
 server.modules = ( "mod_cgi" )

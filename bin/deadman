@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-# keen-deadman — «мёртвая рука» на роутере Keenetic с Entware.
+# deadman — «мёртвая рука» на роутере Keenetic с Entware.
 #
 # Наблюдаемый сервер регулярно шлёт сигнал «жив» (HTTP-запрос) на роутер.
 # Роутер следит за давностью сигнала и за доступностью заданных адресов и
@@ -314,7 +314,7 @@ write_conf() {
   mkdir -p "$CONF_DIR"
   umask 077
   {
-    echo "# keen-deadman — настройки. Править можно руками, затем: deadman restart"
+    echo "# deadman — настройки. Править можно руками, затем: deadman restart"
     for v in NAME TG_TOKEN TG_CHAT_ID TG_PROXY BEAT_TIMEOUT_MIN LISTEN_ADDR LISTEN_PORT \
              PUBLIC_BASE CHECK_URLS URL_FAILS INET_HOSTS REMIND_MIN INTERVAL_SEC; do
       eval "val=\${$v}"
@@ -325,7 +325,7 @@ write_conf() {
 }
 
 cmd_setup() {
-  say "== Настройка keen-deadman =="
+  say "== Настройка deadman =="
   say "Пустой ответ оставляет значение в скобках."
   ask NAME "Как называть наблюдаемый сервер в сообщениях" "$NAME"
   ask TG_TOKEN "Токен Telegram-бота (от @BotFather)" ""
@@ -361,7 +361,7 @@ cmd_restart() { cmd_stop >/dev/null; cmd_start; }
 # ---- Сведения --------------------------------------------------------------
 
 cmd_status() {
-  say "keen-deadman $VERSION"
+  say "deadman $VERSION"
   if is_running "$LOOP_PID"; then say "Сторож: работает (pid $(cat "$LOOP_PID"))"; else say "Сторож: остановлен"; fi
   if is_running "$HTTPD_PID"; then say "Приём:  работает на $(listen_addr):$LISTEN_PORT"; else say "Приём:  остановлен"; fi
   last=$(read_num "$STATE/last_beat" 0)
@@ -381,7 +381,7 @@ cmd_status() {
 }
 
 cmd_test() {
-  if tg_send "✅ $NAME: проверка связи keen-deadman с роутера"; then
+  if tg_send "✅ $NAME: проверка связи deadman с роутера"; then
     say "Отправлено — сообщение должно прийти в Telegram."
   else
     die "Telegram не принял сообщение: проверьте токен, ID чата и доступ к api.telegram.org (прокси TG_PROXY)"
@@ -410,7 +410,7 @@ cmd_update() {
 
 usage() {
   cat <<EOF
-keen-deadman $VERSION — «мёртвая рука» для Keenetic
+deadman $VERSION — «мёртвая рука» для Keenetic
 
   deadman setup        настроить (Telegram, порт, адреса) и запустить
   deadman start|stop|restart
@@ -421,6 +421,8 @@ keen-deadman $VERSION — «мёртвая рука» для Keenetic
   deadman log [-f]     журнал
   deadman update       обновить из репозитория
   deadman uninstall [--purge]
+
+Описание и исходники: https://github.com/YBakalenko/deadman
 EOF
 }
 
