@@ -1,0 +1,19 @@
+# keen-deadman: отдельный экземпляр lighttpd только для приёма сигнала.
+# Собирается командой `deadman start` из этого шаблона — правьте шаблон
+# (/opt/share/deadman/lighttpd.conf.in) или deadman.conf, а не готовый файл.
+server.modules = ( "mod_cgi" )
+
+server.document-root = "@SHARE@/www"
+server.bind = "@ADDR@"
+server.port = @PORT@
+server.pid-file = "@PID@"
+server.errorlog = "@LOG_DIR@/deadman-httpd.log"
+server.tag = ""
+server.max-request-size = 64
+server.max-connections = 16
+index-file.names = ()
+
+# Исполняется только /beat; всё прочее — 404.
+$HTTP["url"] =~ "^/beat(/|$)" {
+  cgi.assign = ( "" => "" )
+}

@@ -1,0 +1,442 @@
+#!/bin/sh
+# ============================================================================
+# keen-deadman — «мёртвая рука» на роутере Keenetic с Entware.
+#
+# Наблюдаемый сервер регулярно шлёт сигнал «жив» (HTTP-запрос) на роутер.
+# Роутер следит за давностью сигнала и за доступностью заданных адресов и
+# пишет в Telegram, когда сигнал пропал или адрес перестал отвечать, и ещё раз,
+# когда всё вернулось. Роутер стоит в другом месте, чем сервер, поэтому
+# узнаёт об отказе сервера ЦЕЛИКОМ — того, о чём сам сервер сообщить не может.
+#
+# Только POSIX sh (busybox ash), curl и lighttpd из Entware.
+# ============================================================================
+set -u
+
+VERSION="1.0.0"
+
+P="${DEADMAN_PREFIX:-/opt}"
+CONF_DIR="$P/etc/deadman"
+CONF="$CONF_DIR/deadman.conf"
+TOKEN_FILE="$CONF_DIR/beat.token"
+SHARE="$P/share/deadman"
+STATE="$P/var/lib/deadman"
+RUN_DIR="$P/var/run"
+LOG_DIR="$P/var/log"
+LOG="$LOG_DIR/deadman.log"
+HTTPD_CONF="$CONF_DIR/lighttpd.conf"
+HTTPD_PID="$RUN_DIR/deadman-httpd.pid"
+LOOP_PID="$RUN_DIR/deadman.pid"
+LIGHTTPD_BIN="${LIGHTTPD_BIN:-$P/sbin/lighttpd}"
+LOG_MAX_BYTES=262144
+
+# ---- Значения по умолчанию (перекрываются deadman.conf) --------------------
+NAME="Сервер"
+TG_TOKEN=""
+TG_CHAT_ID=""
+TG_PROXY=""
+TG_API="https://api.telegram.org"
+BEAT_TIMEOUT_MIN=15
+LISTEN_ADDR=""
+LISTEN_PORT=8089
+PUBLIC_BASE=""
+CHECK_URLS=""
+URL_FAILS=3
+INET_HOSTS="77.88.8.8 1.1.1.1"
+REMIND_MIN=60
+INTERVAL_SEC=60
+
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+# ---- Общее -----------------------------------------------------------------
+
+now() { date +%s; }
+
+log() {
+  mkdir -p "$LOG_DIR"
+  if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt "$LOG_MAX_BYTES" ]; then
+    mv -f "$LOG" "$LOG.1"
+  fi
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"
+}
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+
+# Значение для записи в conf: в одинарных кавычках, кавычка внутри — '\''.
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+read_num() { v=$(cat "$1" 2>/dev/null) || v=""; case "$v" in ''|*[!0-9]*) echo "${2:-0}" ;; *) echo "$v" ;; esac; }
+
+hm() { date -d "@$1" '+%d.%m %H:%M' 2>/dev/null || date '+%d.%m %H:%M'; }
+
+minutes() { echo $(( ($1 + 59) / 60 )); }
+
+lan_addr() {
+  ip -4 addr show br0 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}'
+}
+
+listen_addr() {
+  if [ -n "$LISTEN_ADDR" ]; then echo "$LISTEN_ADDR"; return; fi
+  a=$(lan_addr)
+  echo "${a:-0.0.0.0}"
+}
+
+beat_token() { cat "$TOKEN_FILE" 2>/dev/null; }
+
+beat_url() {
+  t=$(beat_token)
+  if [ -n "$PUBLIC_BASE" ]; then
+    echo "${PUBLIC_BASE%/}/beat/$t"
+  else
+    echo "http://$(listen_addr):$LISTEN_PORT/beat/$t"
+  fi
+}
+
+# ---- Telegram --------------------------------------------------------------
+
+tg_send() {
+  [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ] || return 1
+  # shellcheck disable=SC2086
+  curl -fsS -m 20 ${TG_PROXY:+-x "$TG_PROXY"} -o /dev/null \
+    --data-urlencode "chat_id=$TG_CHAT_ID" \
+    --data-urlencode "text=$1" \
+    -d disable_web_page_preview=true \
+    "${TG_API%/}/bot$TG_TOKEN/sendMessage" 2>>"$LOG"
+}
+
+# Не дошло — в очередь: отправится, когда Telegram снова ответит. Тревога,
+# которая потерялась молча, хуже тревоги, пришедшей с опозданием.
+notify() {
+  log "уведомление: $1"
+  if tg_send "$1"; then return 0; fi
+  mkdir -p "$STATE/outbox"
+  printf '%s\n\n(отложено с %s: Telegram не отвечал)' "$1" "$(hm "$(now)")" \
+    >"$STATE/outbox/$(now).$$.$(awk 'BEGIN{srand(); print int(rand()*100000)}')"
+  log "Telegram недоступен — сообщение в очереди"
+}
+
+flush_outbox() {
+  [ -d "$STATE/outbox" ] || return 0
+  for f in $(ls "$STATE/outbox" 2>/dev/null | sort); do
+    if tg_send "$(cat "$STATE/outbox/$f")"; then
+      rm -f "$STATE/outbox/$f"
+    else
+      return 0
+    fi
+  done
+}
+
+# ---- Состояние проверок ----------------------------------------------------
+# Файл st.<имя>: «ok» или «bad <с какого времени> <когда напомнили>».
+
+set_ok() {
+  f="$STATE/st.$1"
+  line=$(cat "$f" 2>/dev/null) || line="ok"
+  case "$line" in
+    bad*)
+      since=$(echo "$line" | awk '{print $2}')
+      notify "🟢 $NAME: $2 (сбой длился $(minutes $(( $(now) - since ))) мин)"
+      ;;
+  esac
+  echo ok >"$f"
+}
+
+set_bad() {
+  f="$STATE/st.$1"
+  t=$(now)
+  line=$(cat "$f" 2>/dev/null) || line="ok"
+  case "$line" in
+    bad*)
+      since=$(echo "$line" | awk '{print $2}')
+      sent=$(echo "$line" | awk '{print $3}')
+      if [ "$REMIND_MIN" -gt 0 ] && [ $(( t - sent )) -ge $(( REMIND_MIN * 60 )) ]; then
+        notify "🔴 $NAME: всё ещё — $2 (уже $(minutes $(( t - since ))) мин)"
+        echo "bad $since $t" >"$f"
+      fi
+      ;;
+    *)
+      notify "🔴 $NAME: $2"
+      echo "bad $t $t" >"$f"
+      ;;
+  esac
+}
+
+# ---- Одна проверка ---------------------------------------------------------
+
+inet_ok() {
+  for h in $INET_HOSTS; do
+    ping -c 1 -W 3 "$h" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+check_beat() {
+  t=$(now)
+  last=$(read_num "$STATE/last_beat" 0)
+  started=$(read_num "$STATE/started" "$t")
+  back=$(read_num "$STATE/inet_back" 0)
+  # Отсчёт — от самого позднего из: последний сигнал, запуск сторожа,
+  # возвращение интернета дома. Пока роутер был выключен или без сети,
+  # сигналы дойти не могли, и тревога о них была бы ложной.
+  ref=$last
+  [ "$started" -gt "$ref" ] && ref=$started
+  [ "$back" -gt "$ref" ] && ref=$back
+  limit=$(( BEAT_TIMEOUT_MIN * 60 ))
+  if [ $(( t - ref )) -gt "$limit" ]; then
+    if [ "$last" -eq 0 ]; then
+      set_bad beat "сигнал «жив» не приходил ни разу за $BEAT_TIMEOUT_MIN мин после запуска сторожа — проверьте адрес у отправителя"
+    else
+      set_bad beat "нет сигнала «жив» $(minutes $(( t - last ))) мин (последний — $(hm "$last"))"
+    fi
+  else
+    set_ok beat "сигнал «жив» снова приходит"
+  fi
+}
+
+url_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '_' | cut -c1-80; }
+
+check_urls() {
+  for u in $CHECK_URLS; do
+    k="url_$(url_key "$u")"
+    code=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' "$u" 2>/dev/null) || code="${code:-000}"
+    case "$code" in
+      2??|3??)
+        echo 0 >"$STATE/fails.$k"
+        set_ok "$k" "$u снова отвечает"
+        ;;
+      *)
+        n=$(( $(read_num "$STATE/fails.$k" 0) + 1 ))
+        echo "$n" >"$STATE/fails.$k"
+        if [ "$n" -ge "$URL_FAILS" ]; then
+          set_bad "$k" "$u не отвечает (код $code, $n проверок подряд)"
+        fi
+        ;;
+    esac
+  done
+}
+
+cmd_check() {
+  mkdir -p "$STATE"
+  # Без двух проверок разом: цикл и ручной запуск не должны писать одно состояние.
+  if ! mkdir "$STATE/.lock" 2>/dev/null; then
+    lock_age=$(( $(now) - $(read_num "$STATE/.lock/at" 0) ))
+    [ "$lock_age" -lt 300 ] && return 0
+    rm -rf "$STATE/.lock"; mkdir "$STATE/.lock" || return 0
+  fi
+  now >"$STATE/.lock/at"
+  trap 'rm -rf "$STATE/.lock"' EXIT INT TERM
+
+  if ! inet_ok; then
+    if [ ! -f "$STATE/offline" ]; then
+      now >"$STATE/offline"
+      log "у роутера нет интернета — проверки отложены"
+    fi
+    return 0
+  fi
+  if [ -f "$STATE/offline" ]; then
+    rm -f "$STATE/offline"
+    now >"$STATE/inet_back"
+    log "интернет у роутера вернулся"
+  fi
+  flush_outbox
+  check_beat
+  check_urls
+}
+
+# ---- Службы ----------------------------------------------------------------
+
+is_running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+render_httpd_conf() {
+  addr=$(listen_addr)
+  mkdir -p "$CONF_DIR" "$RUN_DIR" "$LOG_DIR"
+  sed -e "s|@SHARE@|$SHARE|g" -e "s|@ADDR@|$addr|g" -e "s|@PORT@|$LISTEN_PORT|g" \
+      -e "s|@PID@|$HTTPD_PID|g" -e "s|@LOG_DIR@|$LOG_DIR|g" \
+      "$SHARE/lighttpd.conf.in" >"$HTTPD_CONF"
+}
+
+cmd_start() {
+  [ -f "$CONF" ] || die "нет настроек — выполните: deadman setup"
+  [ -x "$LIGHTTPD_BIN" ] || die "не найден lighttpd ($LIGHTTPD_BIN) — opkg install lighttpd lighttpd-mod-cgi"
+  mkdir -p "$STATE" "$RUN_DIR"
+  render_httpd_conf
+  if ! is_running "$HTTPD_PID"; then
+    "$LIGHTTPD_BIN" -f "$HTTPD_CONF" || die "lighttpd не запустился — смотрите $LOG_DIR/deadman-httpd.log"
+  fi
+  if ! is_running "$LOOP_PID"; then
+    now >"$STATE/started"
+    nohup "$0" _loop >/dev/null 2>&1 &
+    echo $! >"$LOOP_PID"
+  fi
+  log "запущен: приём на $(listen_addr):$LISTEN_PORT, проверка раз в $INTERVAL_SEC с"
+  say "Запущено. Приём сигнала: $(listen_addr):$LISTEN_PORT"
+}
+
+cmd_stop() {
+  for pf in "$LOOP_PID" "$HTTPD_PID"; do
+    if is_running "$pf"; then kill "$(cat "$pf")" 2>/dev/null; fi
+    rm -f "$pf"
+  done
+  log "остановлен"
+  say "Остановлено."
+}
+
+cmd_loop() {
+  while :; do
+    "$0" check
+    sleep "$INTERVAL_SEC"
+  done
+}
+
+# ---- Настройка -------------------------------------------------------------
+
+ask() {
+  # ask <переменная> <вопрос> <значение по умолчанию>
+  eval "cur=\${$1}"
+  def=${cur:-$3}
+  if [ "${DEADMAN_NONINTERACTIVE:-0}" = 1 ]; then
+    eval "$1=\${DM_$1:-\$def}"
+    return
+  fi
+  if [ -n "$def" ]; then printf '%s [%s]: ' "$2" "$def"; else printf '%s: ' "$2"; fi
+  read -r ans
+  [ -z "$ans" ] && ans=$def
+  eval "$1=\$ans"
+}
+
+gen_token() {
+  tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32
+}
+
+write_conf() {
+  val=""  # заполняется через eval ниже
+  mkdir -p "$CONF_DIR"
+  umask 077
+  {
+    echo "# keen-deadman — настройки. Править можно руками, затем: deadman restart"
+    for v in NAME TG_TOKEN TG_CHAT_ID TG_PROXY BEAT_TIMEOUT_MIN LISTEN_ADDR LISTEN_PORT \
+             PUBLIC_BASE CHECK_URLS URL_FAILS INET_HOSTS REMIND_MIN INTERVAL_SEC; do
+      eval "val=\${$v}"
+      echo "$v=$(quote "$val")"
+    done
+  } >"$CONF"
+  chmod 600 "$CONF"
+}
+
+cmd_setup() {
+  say "== Настройка keen-deadman =="
+  say "Пустой ответ оставляет значение в скобках."
+  ask NAME "Как называть наблюдаемый сервер в сообщениях" "$NAME"
+  ask TG_TOKEN "Токен Telegram-бота (от @BotFather)" ""
+  ask TG_CHAT_ID "ID чата для тревог (личный или группы)" ""
+  ask TG_PROXY "Прокси для Telegram, если нужен (например socks5h://127.0.0.1:1080)" ""
+  ask BEAT_TIMEOUT_MIN "Через сколько минут без сигнала тревожить" "$BEAT_TIMEOUT_MIN"
+  ask LISTEN_PORT "Порт приёма сигнала на роутере" "$LISTEN_PORT"
+  ask PUBLIC_BASE "Внешний адрес приёмника (KeenDNS), например https://deadman.myname.keenetic.pro" ""
+  ask CHECK_URLS "Адреса для проверки снаружи, через пробел (можно пусто)" ""
+  ask REMIND_MIN "Напоминать о незакрытой тревоге каждые N минут (0 — нет)" "$REMIND_MIN"
+  for v in BEAT_TIMEOUT_MIN LISTEN_PORT REMIND_MIN; do
+    eval "val=\${$v}"
+    case "$val" in ''|*[!0-9]*) die "$v должно быть числом" ;; esac
+  done
+  write_conf
+  if [ ! -s "$TOKEN_FILE" ]; then
+    gen_token >"$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+  fi
+  [ -s "$TOKEN_FILE" ] || die "не удалось создать ключ сигнала"
+  say ""
+  say "Сохранено в $CONF"
+  cmd_restart
+  say ""
+  say "Адрес, на который сервер должен слать сигнал (GET или POST, раз в 1–5 минут):"
+  say "  $(beat_url)"
+  say "Держите его в секрете: по нему любой может «оживить» сервер."
+  [ -n "$TG_TOKEN" ] && say "Проверить Telegram: deadman test"
+}
+
+cmd_restart() { cmd_stop >/dev/null; cmd_start; }
+
+# ---- Сведения --------------------------------------------------------------
+
+cmd_status() {
+  say "keen-deadman $VERSION"
+  if is_running "$LOOP_PID"; then say "Сторож: работает (pid $(cat "$LOOP_PID"))"; else say "Сторож: остановлен"; fi
+  if is_running "$HTTPD_PID"; then say "Приём:  работает на $(listen_addr):$LISTEN_PORT"; else say "Приём:  остановлен"; fi
+  last=$(read_num "$STATE/last_beat" 0)
+  if [ "$last" -gt 0 ]; then
+    say "Последний сигнал: $(hm "$last") ($(( ($(now) - last) / 60 )) мин назад)"
+  else
+    say "Последний сигнал: ни разу"
+  fi
+  [ -f "$STATE/offline" ] && say "У роутера нет интернета с $(hm "$(read_num "$STATE/offline" 0)")"
+  for f in "$STATE"/st.*; do
+    [ -f "$f" ] || continue
+    say "  ${f##*/st.}: $(awk '{print $1}' "$f")"
+  done
+  n=$(ls "$STATE/outbox" 2>/dev/null | wc -l)
+  [ "$n" -gt 0 ] && say "В очереди на отправку: $n"
+  say "Адрес сигнала: $(beat_url | sed 's|/beat/.*|/beat/********|')"
+}
+
+cmd_test() {
+  if tg_send "✅ $NAME: проверка связи keen-deadman с роутера"; then
+    say "Отправлено — сообщение должно прийти в Telegram."
+  else
+    die "Telegram не принял сообщение: проверьте токен, ID чата и доступ к api.telegram.org (прокси TG_PROXY)"
+  fi
+}
+
+cmd_uninstall() {
+  cmd_stop >/dev/null
+  rm -f "$P/etc/init.d/S99deadman" "$P/bin/deadman"
+  rm -rf "$SHARE" "$STATE"
+  if [ "${1:-}" = "--purge" ]; then
+    rm -rf "$CONF_DIR" "$LOG" "$LOG.1"
+    say "Удалено вместе с настройками."
+  else
+    say "Удалено. Настройки оставлены в $CONF_DIR (полностью: deadman uninstall --purge)."
+  fi
+}
+
+cmd_update() {
+  repo=$(cat "$SHARE/repo" 2>/dev/null)
+  [ -n "$repo" ] || die "неизвестен репозиторий установки"
+  tmp="/tmp/deadman-install.sh"
+  curl -fsSL -o "$tmp" "https://raw.githubusercontent.com/$repo/install.sh" || die "не скачался install.sh"
+  DEADMAN_REPO="${repo%/*}" DEADMAN_BRANCH="${repo##*/}" sh "$tmp"
+}
+
+usage() {
+  cat <<EOF
+keen-deadman $VERSION — «мёртвая рука» для Keenetic
+
+  deadman setup        настроить (Telegram, порт, адреса) и запустить
+  deadman start|stop|restart
+  deadman status       состояние, последний сигнал, тревоги
+  deadman url          адрес, на который сервер шлёт сигнал
+  deadman test         пробное сообщение в Telegram
+  deadman check        одна проверка сейчас (её же делает сторож)
+  deadman log [-f]     журнал
+  deadman update       обновить из репозитория
+  deadman uninstall [--purge]
+EOF
+}
+
+case "${1:-}" in
+  setup) cmd_setup ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  status) cmd_status ;;
+  url) beat_url ;;
+  test) cmd_test ;;
+  check) cmd_check ;;
+  _loop) cmd_loop ;;
+  log) if [ "${2:-}" = "-f" ]; then tail -f "$LOG"; else tail -n 50 "$LOG"; fi ;;
+  update) cmd_update ;;
+  uninstall) cmd_uninstall "${2:-}" ;;
+  version|-v|--version) say "$VERSION" ;;
+  *) usage ;;
+esac
