@@ -90,6 +90,19 @@ $D check
 outbox | grep -q "http://127.0.0.1:1/ не отвечает (код 000, 2 проверок подряд)" || { outbox; fail "нет тревоги по адресу"; }
 ok "адрес не отвечает дважды — тревога"
 
+# KeenDNS «This Keenetic device» ходит через петлю: приём на домашнем адресе
+# обязан отвечать и на 127.0.0.1 (иначе снаружи 502).
+lan=$(ip -4 addr show eth0 | awk '/inet /{split($2,a,"/"); print a[1]; exit}')
+sed -i "s|^LISTEN_ADDR=.*|LISTEN_ADDR='$lan'|" "$P/etc/deadman/deadman.conf"
+$D restart >/dev/null
+sleep 1
+for a in "$lan" 127.0.0.1; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://$a:18089/beat/wrong")
+  [ "$code" = 404 ] || fail "приём на $a: $code"
+done
+$D stop >/dev/null
+ok "приём на домашнем адресе отвечает и через петлю"
+
 $D status >/dev/null || fail "status"
 $D uninstall --purge >/dev/null
 [ ! -e "$P/bin/deadman" ] && [ ! -e "$P/etc/deadman" ] || fail "uninstall --purge"

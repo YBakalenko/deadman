@@ -12,7 +12,7 @@
 # ============================================================================
 set -u
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 P="${DEADMAN_PREFIX:-/opt}"
 CONF_DIR="$P/etc/deadman"
@@ -254,6 +254,14 @@ render_httpd_conf() {
   sed -e "s|@SHARE@|$SHARE|g" -e "s|@ADDR@|$addr|g" -e "s|@PORT@|$LISTEN_PORT|g" \
       -e "s|@PID@|$HTTPD_PID|g" -e "s|@LOG_DIR@|$LOG_DIR|g" \
       "$SHARE/lighttpd.conf.in" >"$HTTPD_CONF"
+  # ⚠️ KeenDNS с назначением «This Keenetic device» ходит к приложению через
+  # петлю 127.0.0.1, хотя в таблице показывает адрес домашней сети. Приём
+  # только на 192.168.1.1 давал снаружи 502 при рабочем локальном ответе.
+  # Петля наружу не видна, поэтому слушать её безопасно.
+  case "$addr" in
+    0.0.0.0|127.0.0.1) ;;
+    *) printf '\n# Петля — для прокси KeenDNS.\n$SERVER["socket"] == "127.0.0.1:%s" { }\n' "$LISTEN_PORT" >>"$HTTPD_CONF" ;;
+  esac
 }
 
 cmd_start() {
